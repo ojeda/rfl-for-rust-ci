@@ -1,0 +1,65 @@
+on: push
+
+jobs:
+  ci:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Preparations that may or may not apply to your CI.
+        run: |
+          sudo apt-get -y update
+
+          # In the `ubuntu-22.04` image, there are several LLVMs installed, and `clang` is
+          # older (14), while `bindgen` finds a newer `libclang` (15) by default, so just get rid
+          # of all of them to avoid warnings, but I guess it should not be an issue in your image.
+          sudo apt-get -y purge libclang*
+
+          # Install kernel build dependencies. The ones in the first line are already there in
+          # `ubuntu-22.04` -- adjust for your image as needed (e.g. use your own LLVM).
+          sudo apt-get -y --no-install-recommends install \
+              ca-certificates curl git file bc make flex bison python3 libssl-dev \
+              libelf-dev llvm clang lld
+
+          # Get `rustc` etc. in the path -- adjust as needed for the CI.
+          # Note that we still need to relax a few things in the kernel side to support several
+          # Rust versions, so we cannot enable it right away (or we could ignore any/all errors).
+          curl --proto '=https' --tlsv1.2 -sSf -o rustup.sh https://sh.rustup.rs
+          sh rustup.sh -y --default-toolchain 1.76.0 --profile minimal \
+            --component rust-src \
+            --component clippy \
+            --component rustfmt
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Clone Linux (example tag).
+        run: git clone --depth 1 --branch v6.9 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+
+      - name: Build `bindgen` (if needed -- you may have one around already?).
+        run: cargo install --locked --version $(linux/scripts/min-tool-version.sh bindgen) bindgen-cli
+
+      - name: Configure Linux.
+        run: |
+          cat <<EOF > linux/kernel/configs/rfl-for-rust-ci.config
+          # CONFIG_RETHUNK is not set
+          # CONFIG_X86_KERNEL_IBT is not set
+          # CONFIG_GCC_PLUGINS is not set
+
+          CONFIG_RUST=y
+
+          CONFIG_SAMPLES=y
+          CONFIG_SAMPLES_RUST=y
+
+          CONFIG_SAMPLE_RUST_MINIMAL=m
+          CONFIG_SAMPLE_RUST_PRINT=y
+
+          CONFIG_RUST_PHYLIB_ABSTRACTIONS=y
+          CONFIG_AX88796B_PHY=y
+          CONFIG_AX88796B_RUST_PHY=y
+
+          CONFIG_KUNIT=y
+          CONFIG_RUST_KERNEL_DOCTESTS=y
+          EOF
+
+          make -C linux LLVM=1 -j$(($(nproc) + 1)) rustavailable defconfig rfl-for-rust-ci.config
+
+      - name: Build Linux's Rust code (only).
+        run: make -C linux LLVM=1 -j$(($(nproc) + 1)) samples/rust/rust_minimal.o samples/rust/rust_print.o drivers/net/phy/ax88796b_rust.o
